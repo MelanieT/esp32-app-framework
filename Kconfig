@@ -1,0 +1,23 @@
+menu "Cpp App framework"
+
+config USE_SETUP_WEB_INTERFACE
+    bool "Use access point web setup to connect to wifi"
+
+config WEB_INTERFACE_SPIFFS_PARTITION_NAME
+    depends on USE_SETUP_WEB_INTERFACE
+    string "Name of spiffs partition (in partitions.csv)"
+    default "spiffs"
+
+config WEB_INTERFACE_DIR
+    depends on USE_SETUP_WEB_INTERFACE
+    string "Directory from which to build spiffs for setup"
+
+config AP_MODE_HOSTNAME_PREFIX
+    depends on USE_SETUP_WEB_INTERFACE
+    string "Hostname prefix for AP mode."
+
+config AP_MODE_PASSWORD
+    depends on USE_SETUP_WEB_INTERFACE
+    string "Password for initial connection (blank for open)"
+
+endmenu
