@@ -7,6 +7,7 @@
 #include "AppFramework.h"
 #include "nvs_flash.h"
 #include "CPPNVS.h"
+#include "SimpleWebServer.h"
 
 using namespace std;
 
@@ -19,6 +20,8 @@ void AppFramework::init()
 #ifdef CONFIG_USE_SETUP_WEB_INTERFACE
     m_hostname = generateHostname();
 #endif
+
+    SimpleWebServer::setHostname(m_hostname);
 
     NVS nvs("wifi");
 
@@ -40,10 +43,11 @@ void AppFramework::init()
     else
     {
         auto auth = WIFI_AUTH_WPA2_WPA3_PSK;
-        if (m_password.empty())
+        string password = CONFIG_AP_MODE_PASSWORD;
+        if (password.empty())
             auth = WIFI_AUTH_OPEN;
 
-        m_wifi->startAP(m_hostname, m_password, auth);
+        m_wifi->startAP(m_hostname, password, auth);
     }
 #endif
 
@@ -69,6 +73,7 @@ esp_err_t AppFramework::staStop()
 {
     if (m_staActive)
     {
+        SimpleWebServer::setRedirectToCaptive(true);
         m_staActive = false;
         if (m_handler)
             m_handler->staStopped();
@@ -87,6 +92,7 @@ esp_err_t AppFramework::staGotIp(ip_event_got_ip_t *info)
 {
     if (!m_staActive)
     {
+        SimpleWebServer::setRedirectToCaptive(false);
         m_staActive = true;
         if (m_handler)
             m_handler->staActive();
@@ -98,6 +104,7 @@ esp_err_t AppFramework::apStart()
 {
     if (!m_apActive)
     {
+        SimpleWebServer::setRedirectToCaptive(true);
         m_apActive = true;
         if (m_handler)
             m_handler->apActive();
