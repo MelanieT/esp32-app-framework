@@ -17,6 +17,8 @@ using namespace std;
 
 string SimpleWebServer::m_hostname;
 bool SimpleWebServer::m_redirectToCaptive = false;
+bool SimpleWebServer::m_spa = false;
+bool SimpleWebServer::m_closeCaptive = false;
 
 static const char *TAG = "simplewebserver";
 
@@ -87,33 +89,37 @@ esp_err_t SimpleWebServer::download_get_handler(httpd_req_t *req)
 
     if (!strcmp(req->uri, "/"))
         strcpy((char *) req->uri, "/index.html");
-    const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
-                                             req->uri, sizeof(filepath));
-    if (!filename) {
-        ESP_LOGE(TAG, "Filename is too long");
-        /* Respond with 500 Internal Server Error */
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Filename too long");
-        return ESP_FAIL;
-    }
 
-//    /* If name has trailing '/', respond with directory contents */
-//    if (filename[strlen(filename) - 1] == '/') {
-//        return http_resp_dir_html(req, filepath);
-//    }
+    const char *filename;
+    bool triedIndex = false;
+    while (true)
+    {
+        filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
+                                                 req->uri, sizeof(filepath));
+        if (!filename) {
+            ESP_LOGE(TAG, "Filename is too long");
+            /* Respond with 500 Internal Server Error */
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Filename too long");
+            return ESP_FAIL;
+        }
 
-    if (stat(filepath, &file_stat) == -1) {
-        /* If file not present on SPIFFS check if URI
-         * corresponds to one of the hardcoded paths */
-//        if (strcmp(filename, "/index.html") == 0) {
-//            return index_html_get_handler(req);
-//        } else if (strcmp(filename, "/favicon.ico") == 0) {
-//            return favicon_get_handler(req);
-//        }
-        ESP_LOGE(TAG, "Failed to stat file : %s", filepath);
-        /* Respond with 404 Not Found */
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File does not exist");
-        return ESP_FAIL;
-    }
+        if (!stat(filepath, &file_stat)) {
+            break;
+        }
+
+        if (!triedIndex && m_spa)
+        {
+            strcpy((char *) req->uri, "/index.html");
+            triedIndex = true;
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to stat file : %s", filepath);
+            /* Respond with 404 Not Found */
+            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File does not exist");
+            return ESP_FAIL;
+        }
+    };
 
     fd = fopen(filepath, "r");
     if (!fd) {
@@ -176,7 +182,7 @@ esp_err_t SimpleWebServer::root_get_handler(httpd_req_t *req)
     strcat(fullhost, ".net");
 
     ApiHttpRequest req2(req);
-    printf("Body: %s\r\n", req2.body().c_str());
+//    printf("Body: %s\r\n", req2.body().c_str());
 
     auto resp = ApiServer::RequestHandler(req2);
     if (resp.statusCode() != 404)
@@ -192,21 +198,29 @@ esp_err_t SimpleWebServer::root_get_handler(httpd_req_t *req)
     }
 
     // This is what pops up the captive portal
-    printf("Fullhost: %s Host: %s\r\n", fullhost, host);
+//    printf("Fullhost: %s Host: %s\r\n", fullhost, host);
     if (strcasecmp(fullhost, host) && m_redirectToCaptive)
     {
-        sprintf(fullhost, "http://%s.net/index.html", m_hostname.c_str());
-        httpd_resp_set_hdr(req, "Location", fullhost);
-        httpd_resp_send_custom_err(req, "302", "Moved temporarily");
-        return ESP_OK;
+        if (!strcasecmp(host, "captive.apple.com") && m_closeCaptive)
+        {
+            strcpy((char *)req->uri, "/success.html");
+        }
+        else
+        {
+            sprintf(fullhost, "http://%s.net/index.html", m_hostname.c_str());
+            httpd_resp_set_hdr(req, "Location", fullhost);
+            httpd_resp_send_custom_err(req, "302", "Moved temporarily");
+            return ESP_OK;
+        }
     }
 
     return download_get_handler(req);
 }
 
-httpd_handle_t SimpleWebServer::start_webserver(const char *basePath)
+httpd_handle_t SimpleWebServer::start_webserver(const char *basePath, bool spa)
 {
     httpd_handle_t server = nullptr;
+    m_spa = spa;
 
     // Start the httpd server
     ESP_LOGI(TAG, "Starting server");

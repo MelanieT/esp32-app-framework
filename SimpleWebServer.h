@@ -24,10 +24,11 @@ private:
         char scratch[SCRATCH_BUFSIZE];
     };
 public:
-    static httpd_handle_t start_webserver(const char *basePath);
+    static httpd_handle_t start_webserver(const char *basePath, bool spa = false);
     static esp_err_t stop_webserver(httpd_handle_t server);
     static inline void setHostname(std::string host) { m_hostname = std::move(host); };
     static inline void setRedirectToCaptive(bool redirect) { m_redirectToCaptive = redirect; };
+    static inline void setCloseCaptive(bool close) { m_closeCaptive = close; };
 
 private:
     static esp_err_t set_content_type_from_file(httpd_req_t *req, const char *filename);
@@ -37,6 +38,8 @@ private:
 
     static std::string m_hostname;
     static bool m_redirectToCaptive;
+    static bool m_spa;
+    static bool m_closeCaptive;
 };
 
 
