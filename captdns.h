@@ -67,7 +67,7 @@ private:
     static char *strToLabel(char *str, char *label, int maxLen);
 
 
-    TaskHandle_t m_handle;
+    TaskHandle_t m_handle = nullptr;
     volatile bool m_run = true;
     int m_socket = -1;
 };

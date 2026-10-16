@@ -21,6 +21,13 @@ using namespace nlohmann;
 
 static const char *TAG = "appframework";
 
+// Without the setup access point, keep trying to join the network forever
+#ifdef CONFIG_STA_CONNECT_ATTEMPTS
+#define STA_CONNECT_ATTEMPTS CONFIG_STA_CONNECT_ATTEMPTS
+#else
+#define STA_CONNECT_ATTEMPTS 5
+#endif
+
 CaptiveDns captDns;
 
 AppFramework::AppFramework(WiFi *wifi)
@@ -30,23 +37,23 @@ AppFramework::AppFramework(WiFi *wifi)
 void AppFramework::init()
 {
     m_hostname = generateHostname();
+    // Before the wifi starts, the station netif takes the name when it's created
+    m_wifi->setStationHostname(m_hostname);
 
-#if defined CONFIG_USE_SETUP_WEB_INTERFACE || CONFIG_START_WEBSERVER_IN_STATION_MODE
+#ifdef APP_FRAMEWORK_WEBSERVER
     UrlMapper::AddMapping("POST", "/deviceData", [this](auto& request, auto& response){this->deviceData(request, response);});
 #endif
-#if defined CONFIG_USE_SETUP_WEB_INTERFACE || CONFIG_ENABLE_DEVICE_API_IN_STATION_MODE
+#ifdef APP_FRAMEWORK_DEVICE_API
     UrlMapper::AddMapping("POST", "/scan", [this](auto& request, auto& response){this->scan(request, response);});
     UrlMapper::AddMapping("POST", "/connect", [this](auto& request, auto& response){this->connect(request, response);});
     UrlMapper::AddMapping("POST", "/deviceControl", [this](auto& request, auto& response){this->deviceControl(request, response);});
 #endif
 
-#if defined CONFIG_USE_SETUP_WEB_INTERFACE || defined CONFIG_START_WEBSERVER_IN_STATION_MODE
+#ifdef APP_FRAMEWORK_WEBSERVER
     mountStorage();
 #endif
 
-#ifdef CONFIG_USE_SETUP_WEB_INTERFACE
     SimpleWebServer::setHostname(m_hostname);
-#endif
 
     NVS nvs("wifi");
 
@@ -62,31 +69,99 @@ void AppFramework::init()
 
     if (!m_ssid.empty())
     {
-        m_wifi->connectSTA(m_ssid, m_password);
+        ESP_LOGI(TAG, "Connecting to %s as %s", m_ssid.c_str(), m_hostname.c_str());
+        // Don't wait: the outcome arrives as events, failures open the setup AP
+        m_wifi->connectSTA(m_ssid, m_password, false);
     }
-#ifdef CONFIG_USE_SETUP_WEB_INTERFACE
     else
     {
-        auto auth = WIFI_AUTH_WPA2_WPA3_PSK;
-        string password = CONFIG_AP_MODE_PASSWORD;
-        if (password.empty())
-            auth = WIFI_AUTH_OPEN;
-
-        m_wifi->startAP(m_hostname, password, auth);
-    }
+#ifdef CONFIG_USE_SETUP_WEB_INTERFACE
+        ESP_LOGI(TAG, "No wifi configured, starting setup access point %s", m_hostname.c_str());
+        startSetupAp();
+#else
+        ESP_LOGW(TAG, "No wifi configured and no setup web interface");
 #endif
+    }
+}
 
+void AppFramework::forgetWifi()
+{
+    NVS nvs("wifi");
+    nvs.erase("ssid");
+    nvs.erase("password");
+    nvs.commit();
+
+    esp_restart();
 }
 
 string AppFramework::generateHostname()
 {
     uint8_t chipid[6];
     esp_read_mac(chipid, ESP_MAC_WIFI_STA);
-    static char hostname[32] = CONFIG_AP_MODE_HOSTNAME_PREFIX;
-    hostname[sizeof(hostname) - 1] = 0;
-    snprintf(hostname + strlen(hostname), sizeof(hostname) - strlen(hostname) - 1, "_%02x%02x%02x", chipid[3], chipid[4], chipid[5]);
+    char hostname[32];
+    // Not '_', it isn't valid in host names
+    snprintf(hostname, sizeof(hostname), "%s-%02x%02x%02x", CONFIG_AP_MODE_HOSTNAME_PREFIX, chipid[3], chipid[4], chipid[5]);
 
     return {hostname};
+}
+
+void AppFramework::startSetupAp()
+{
+#ifdef CONFIG_USE_SETUP_WEB_INTERFACE
+    auto auth = WIFI_AUTH_WPA2_WPA3_PSK;
+    string password = CONFIG_AP_MODE_PASSWORD;
+    if (password.empty())
+        auth = WIFI_AUTH_OPEN;
+
+    m_wifi->startAP(m_hostname, password, auth);
+#endif
+}
+
+void AppFramework::startRetryTimer()
+{
+    if (!m_retryTimer)
+    {
+        esp_timer_create_args_t args = {};
+        args.callback = retryTimerThunk;
+        args.arg = this;
+        args.name = "sta_retry";
+        esp_timer_create(&args, &m_retryTimer);
+    }
+    if (!esp_timer_is_active(m_retryTimer))
+        esp_timer_start_periodic(m_retryTimer, (uint64_t) CONFIG_STA_RETRY_INTERVAL_SECONDS * 1000000);
+}
+
+void AppFramework::retryTimerThunk(void *arg)
+{
+    static_cast<AppFramework *>(arg)->retryStation();
+}
+
+void AppFramework::retryStation()
+{
+    if (m_staActive || m_testConnection || m_ssid.empty())
+        return;
+
+    // Joining scans all channels, which takes the AP off its channel. Leave anyone using it alone.
+    wifi_sta_list_t clients;
+    if (m_apActive && esp_wifi_ap_get_sta_list(&clients) == ESP_OK && clients.num > 0)
+        return;
+
+    ESP_LOGI(TAG, "Trying to join %s again", m_ssid.c_str());
+    esp_wifi_connect();
+}
+
+void AppFramework::startMdns()
+{
+#ifdef CONFIG_ENABLE_MDNS
+    if (m_mdns)
+        return;
+
+    m_mdns = new MDNS();
+    m_mdns->setHostname(m_hostname);
+    m_mdns->setInstance(m_hostname);
+    if (m_startWebserverInStationMode)
+        m_mdns->serviceAdd((const char *) nullptr, "_http", "_tcp", 80);
+#endif
 }
 
 esp_err_t AppFramework::staStart()
@@ -94,27 +169,60 @@ esp_err_t AppFramework::staStart()
     return ESP_OK;
 }
 
+// The station stopped or lost the network
+void AppFramework::stationLost()
+{
+    if (!m_staActive)
+        return;
+
+    m_staActive = false;
+#ifdef APP_FRAMEWORK_WEBSERVER
+    if (m_webserverStarted && m_startWebserverInStationMode && !m_apActive)
+    {
+        SimpleWebServer::stop_webserver(m_webserver);
+        m_webserver = nullptr;
+        m_webserverStarted = false;
+    }
+#endif
+    SimpleWebServer::setRedirectToCaptive(m_apActive);
+    if (m_handler)
+        m_handler->staStopped();
+}
+
 esp_err_t AppFramework::staStop()
 {
-    if (m_staActive)
-    {
-        if (m_webserverStarted && m_startWebserverInStationMode && !m_apActive)
-        {
-            SimpleWebServer::stop_webserver(m_webserver);
-            m_webserverStarted = false;
-        }
-        SimpleWebServer::setRedirectToCaptive(true);
-        m_staActive = false;
-        if (m_handler)
-            m_handler->staStopped();
-    }
+    stationLost();
     return ESP_OK;
 }
 
 esp_err_t AppFramework::staDisconnected(wifi_event_sta_disconnected_t *info)
 {
-    if (m_staActive && !m_testConnection)
+    // A test connection is handled by tryConnectWifi. Without a network configured there's nothing to retry.
+    if (m_testConnection || m_ssid.empty())
+        return ESP_OK;
+
+    stationLost();
+
+    m_failedAttempts = m_failedAttempts + 1;
+    ESP_LOGW(TAG, "Disconnected from %s, reason %d, attempt %d", m_ssid.c_str(), info->reason, m_failedAttempts);
+
+    if (m_failedAttempts < STA_CONNECT_ATTEMPTS)
+    {
         esp_wifi_connect();
+        return ESP_OK;
+    }
+
+    // From here the retry timer tries again
+#ifdef CONFIG_USE_SETUP_WEB_INTERFACE
+    if (!m_apActive)
+    {
+        ESP_LOGW(TAG, "Can't join %s, starting setup access point %s", m_ssid.c_str(), m_hostname.c_str());
+        m_apFallback = true;
+        startSetupAp();
+    }
+#endif
+    startRetryTimer();
+
     return ESP_OK;
 }
 
@@ -122,24 +230,38 @@ esp_err_t AppFramework::staGotIp(ip_event_got_ip_t *info)
 {
     m_ipAddress = ip4addr_ntoa((const ip4_addr_t *) &info->ip_info.ip);
 
-    if (!m_staActive && !m_testConnection)
+    if (m_testConnection)
+        return ESP_OK;
+
+    ESP_LOGI(TAG, "Connected to %s, ip %s", m_ssid.c_str(), m_ipAddress.c_str());
+
+    m_failedAttempts = 0;
+    if (m_retryTimer)
+        esp_timer_stop(m_retryTimer);
+
+    if (!m_staActive)
     {
-#if defined CONFIG_USE_SETUP_WEB_INTERFACE || defined CONFIG_START_WEBSERVER_IN_STATION_MODE
-        if (m_startWebserverInStationMode)
+#ifdef APP_FRAMEWORK_WEBSERVER
+        if (m_startWebserverInStationMode && !m_webserverStarted)
         {
-            SimpleWebServer::setRedirectToCaptive(false);
-            if (!m_webserverStarted)
-            {
-                m_webserver = SimpleWebServer::start_webserver(CONFIG_SPIFFS_VFS_BASE_PATH, m_webAppIsSpa);
-                m_webserverStarted = true;
-            }
+            m_webserver = SimpleWebServer::start_webserver(CONFIG_SPIFFS_VFS_BASE_PATH, m_webAppIsSpa);
+            m_webserverStarted = m_webserver != nullptr;
         }
-        SimpleWebServer::setRedirectToCaptive(false);
 #endif
+        SimpleWebServer::setRedirectToCaptive(false);
+        startMdns();
         m_staActive = true;
         if (m_handler)
             m_handler->staActive();
     }
+
+    // Back on the network after a failure, the setup AP isn't needed anymore
+    if (m_apFallback)
+    {
+        m_apFallback = false;
+        m_wifi->stopAP();
+    }
+
     return ESP_OK;
 }
 
@@ -147,14 +269,15 @@ esp_err_t AppFramework::apStart()
 {
     if (!m_apActive)
     {
-#if defined CONFIG_USE_SETUP_WEB_INTERFACE
+#ifdef CONFIG_USE_SETUP_WEB_INTERFACE
         if (!m_webserverStarted)
         {
-            SimpleWebServer::setRedirectToCaptive(true);
             m_webserver = SimpleWebServer::start_webserver(CONFIG_SPIFFS_VFS_BASE_PATH, m_webAppIsSpa);
-            m_webserverStarted = true;
-            captDns.start();
+            m_webserverStarted = m_webserver != nullptr;
         }
+        SimpleWebServer::setCloseCaptive(false);
+        SimpleWebServer::setRedirectToCaptive(!m_staActive);
+        captDns.start();
 #endif
 
         m_apActive = true;
@@ -168,21 +291,24 @@ esp_err_t AppFramework::apStop()
 {
     if (m_apActive)
     {
-        if (m_webserverStarted && !m_startWebserverInStationMode)
+        m_apActive = false;
+#ifdef APP_FRAMEWORK_WEBSERVER
+        if (m_webserverStarted && !(m_startWebserverInStationMode && m_staActive))
         {
             SimpleWebServer::stop_webserver(m_webserver);
+            m_webserver = nullptr;
             m_webserverStarted = false;
-            captDns.stop();
         }
+#endif
+        captDns.stop();
         SimpleWebServer::setRedirectToCaptive(false);
-        m_apActive = false;
         if (m_handler)
             m_handler->apStopped();
     }
     return ESP_OK;
 }
 
-#if defined CONFIG_USE_SETUP_WEB_INTERFACE || defined CONFIG_START_WEBSERVER_IN_STATION_MODE
+#ifdef APP_FRAMEWORK_WEBSERVER
 esp_err_t AppFramework::mountStorage()
 {
     ESP_LOGI(TAG, "Initializing SPIFFS");
@@ -207,7 +333,7 @@ esp_err_t AppFramework::mountStorage()
     }
 
     size_t total = 0, used = 0;
-    ret = esp_spiffs_info("spiffs", &total, &used);
+    ret = esp_spiffs_info(m_spiffsPartitionName.c_str(), &total, &used);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
         return ret;
@@ -216,9 +342,7 @@ esp_err_t AppFramework::mountStorage()
     ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
     return ESP_OK;
 }
-#endif
 
-#if defined CONFIG_USE_SETUP_WEB_INTERFACE || CONFIG_START_WEBSERVER_IN_STATION_MODE
 void AppFramework::deviceData(const ApiHttpRequest &req, ApiHttpResponse &resp)
 {
     json reply = {
@@ -233,22 +357,39 @@ void AppFramework::deviceData(const ApiHttpRequest &req, ApiHttpResponse &resp)
     resp.setBody(reply.dump());
 }
 #endif
-#if defined CONFIG_USE_SETUP_WEB_INTERFACE || CONFIG_ENABLE_DEVICE_API_IN_STATION_MODE
+
+#ifdef APP_FRAMEWORK_DEVICE_API
+// The device API is for the setup access point. On the network only with
+// CONFIG_ENABLE_DEVICE_API_IN_STATION_MODE, it changes the wifi without a password.
+bool AppFramework::deviceApiAllowed(ApiHttpResponse &resp)
+{
+#ifndef CONFIG_ENABLE_DEVICE_API_IN_STATION_MODE
+    if (!m_apActive)
+    {
+        resp.setStatusCode(HttpStatus::Code::NotFound);
+        return false;
+    }
+#endif
+    return true;
+}
+
 void AppFramework::scan(const ApiHttpRequest &req, ApiHttpResponse &resp)
 {
-    m_scanned = true;
-    m_apRecords = m_wifi->scan(); // Will block until done
+    if (!deviceApiAllowed(resp))
+        return;
+
+    auto apRecords = m_wifi->scan(); // Will block until done
 
     resp.AddHeader("Content-type", "application/json");
 
     vector<string> aplist;
-    for (auto ap : m_apRecords)
+    for (auto ap : apRecords)
     {
         aplist.push_back(ap.getSSID());
     }
 
     json reply = {
-        {"apCount", m_apRecords.size()},
+        {"apCount", apRecords.size()},
         {"aplist", aplist},
     };
 
@@ -257,6 +398,11 @@ void AppFramework::scan(const ApiHttpRequest &req, ApiHttpResponse &resp)
 
 void AppFramework::connect(const ApiHttpRequest &req, ApiHttpResponse &resp)
 {
+    if (!deviceApiAllowed(resp))
+        return;
+
+    resp.AddHeader("Content-type", "application/json");
+
     try {
         auto jsonData = json::parse(req.body());
         if (jsonData.contains("ssid") && jsonData.contains("password"))
@@ -286,20 +432,19 @@ void AppFramework::connect(const ApiHttpRequest &req, ApiHttpResponse &resp)
     }
 }
 
-
 void AppFramework::deviceControl(const ApiHttpRequest &req, ApiHttpResponse &resp)
 {
+    if (!deviceApiAllowed(resp))
+        return;
+
     try {
         auto jsonData = json::parse(req.body());
 
         string command = jsonData.value("command", "");
         if (command == "wifimode")
         {
-            ESP_LOGI(TAG, "Stopping AP\r\n");
-            m_wifi->stopAP();
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            ESP_LOGI(TAG, "Starting STA, ssid %s\r\n", m_ssid.c_str());
-            m_wifi->connectSTA(m_ssid, m_password, false);
+            // In a task of its own: the response has to go out before the AP goes down
+            xTaskCreate(wifiModeTask, "wifimode", 4096, this, 5, nullptr);
         }
         else
         {
@@ -311,16 +456,35 @@ void AppFramework::deviceControl(const ApiHttpRequest &req, ApiHttpResponse &res
     }
 }
 
+// Leave setup: drop the access point and join the network that was tested
+void AppFramework::wifiModeTask(void *arg)
+{
+    auto framework = static_cast<AppFramework *>(arg);
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    ESP_LOGI(TAG, "Stopping AP");
+    framework->m_apFallback = false;
+    framework->m_failedAttempts = 0;
+    framework->m_wifi->stopAP();
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    ESP_LOGI(TAG, "Starting STA, ssid %s", framework->m_ssid.c_str());
+    framework->m_wifi->connectSTA(framework->m_ssid, framework->m_password, false);
+
+    vTaskDelete(nullptr);
+}
+
 esp_err_t AppFramework::tryConnectWifi(const std::string& ssid, const std::string& password)
 {
     if (m_testConnection)
-        return ESP_ERR_INVALID_ARG;
+        return ESP_ERR_INVALID_STATE;
 
     m_testConnection = true;
 
-    ESP_LOGI(TAG,"Attempting to connect to wifi, ssid %s\r\n", ssid.c_str());
+    ESP_LOGI(TAG,"Attempting to connect to wifi, ssid %s", ssid.c_str());
+    // Only a test, the access point stays up so the setup page can show the outcome
     auto ret = m_wifi->connectSTA(ssid, password, true, true);
-    ESP_LOGI(TAG, "Connect done, result %d\r\n", ret);
+    ESP_LOGI(TAG, "Connect done, result %d", ret);
     vTaskDelay(500 / portTICK_PERIOD_MS);
     m_testConnection = false;
 

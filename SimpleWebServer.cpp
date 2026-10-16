@@ -45,6 +45,22 @@ esp_err_t SimpleWebServer::set_content_type_from_file(httpd_req_t *req, const ch
         return httpd_resp_set_type(req, "image/jpeg");
     } else if (IS_FILE_EXT(filename, ".ico")) {
         return httpd_resp_set_type(req, "image/x-icon");
+    } else if (IS_FILE_EXT(filename, ".svg")) {
+        return httpd_resp_set_type(req, "image/svg+xml");
+    } else if (IS_FILE_EXT(filename, ".png")) {
+        return httpd_resp_set_type(req, "image/png");
+    } else if (IS_FILE_EXT(filename, ".jpg")) {
+        return httpd_resp_set_type(req, "image/jpeg");
+    } else if (IS_FILE_EXT(filename, ".gif")) {
+        return httpd_resp_set_type(req, "image/gif");
+    } else if (IS_FILE_EXT(filename, ".webp")) {
+        return httpd_resp_set_type(req, "image/webp");
+    } else if (IS_FILE_EXT(filename, ".json")) {
+        return httpd_resp_set_type(req, "application/json");
+    } else if (IS_FILE_EXT(filename, ".woff2")) {
+        return httpd_resp_set_type(req, "font/woff2");
+    } else if (IS_FILE_EXT(filename, ".woff")) {
+        return httpd_resp_set_type(req, "font/woff");
     }
     /* This is a limited set only */
     /* For any other type always set as plain text */
@@ -129,7 +145,7 @@ esp_err_t SimpleWebServer::download_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Sending file : %s (%ld bytes)...", filename, file_stat.st_size);
+    ESP_LOGD(TAG, "Sending file : %s (%ld bytes)...", filename, file_stat.st_size);
     set_content_type_from_file(req, filename);
 
     /* Retrieve the pointer to scratch buffer for temporary storage */
@@ -157,7 +173,7 @@ esp_err_t SimpleWebServer::download_get_handler(httpd_req_t *req)
 
     /* Close file after sending complete */
     fclose(fd);
-    ESP_LOGI(TAG, "File sending complete");
+    ESP_LOGD(TAG, "File sending complete");
 
     /* Respond with an empty chunk to signal HTTP response completion */
 #ifdef CONFIG_EXAMPLE_HTTPD_CONN_CLOSE_HEADER
@@ -169,13 +185,12 @@ esp_err_t SimpleWebServer::download_get_handler(httpd_req_t *req)
 
 esp_err_t SimpleWebServer::root_get_handler(httpd_req_t *req)
 {
-    char host[64];
-    esp_err_t ret = httpd_req_get_hdr_value_str(req, "host", host, 64);
+    // Empty when there's no host header, else the comparison below reads garbage
+    char host[64] = "";
+    if (httpd_req_get_hdr_value_str(req, "host", host, sizeof(host)) != ESP_OK)
+        host[0] = 0;
 
-    if (ret == ESP_OK)
-        printf("Host header: %s\r\n", host);
-    printf("URL: %s\r\n", req->uri);
-    printf("Method: %d\r\n", req->method);
+    ESP_LOGD(TAG, "Host: %s URL: %s Method: %d", host, req->uri, req->method);
 
     static char fullhost[128];
     strcpy(fullhost, m_hostname.c_str());

@@ -15,4 +15,7 @@ idf_component_register(
             esp_https_server
             esp-api-server
             spiffs
+            esp_wifi
+            esp_timer
+            nvs_flash
     )

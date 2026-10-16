@@ -2,6 +2,10 @@ menu "Cpp App framework"
 
 config USE_SETUP_WEB_INTERFACE
     bool "Use access point web setup to connect to wifi"
+    help
+        Without wifi credentials, or when the network can't be reached, the
+        device opens an access point with a captive portal serving the setup
+        web interface from SPIFFS.
 
 config WEB_INTERFACE_SPIFFS_PARTITION_NAME
     depends on USE_SETUP_WEB_INTERFACE || START_WEBSERVER_IN_STATION_MODE
@@ -11,24 +15,51 @@ config WEB_INTERFACE_SPIFFS_PARTITION_NAME
 config WEB_INTERFACE_DIR
     depends on USE_SETUP_WEB_INTERFACE || START_WEBSERVER_IN_STATION_MODE
     string "Directory from which to build spiffs for setup"
+    help
+        The build output of the web interface, e.g. the dist-<product> folder
+        of wifi-configurator. Relative paths are relative to the project.
 
 config AP_MODE_HOSTNAME_PREFIX
     string "Hostname prefix for AP mode and MDNS."
+    default "esp32-app"
+    help
+        The hostname is <prefix>-xxxxxx, xxxxxx being the end of the MAC
+        address. It is also the name of the setup access point.
 
 config AP_MODE_PASSWORD
     depends on USE_SETUP_WEB_INTERFACE
     string "Password for initial connection (blank for open)"
 
+config STA_CONNECT_ATTEMPTS
+    depends on USE_SETUP_WEB_INTERFACE
+    int "Failed connection attempts before opening the setup access point"
+    default 5
+    help
+        When the configured network can't be joined this many times in a row,
+        the setup access point is opened. The network is retried in the
+        background while nobody uses the access point.
+
+config STA_RETRY_INTERVAL_SECONDS
+    int "Seconds between attempts to rejoin the network"
+    default 60
+    help
+        With the setup access point open, or after all connection attempts
+        failed without it, the network is tried again at this interval.
+
 config START_WEBSERVER_IN_STATION_MODE
-    boolean "Start the web server even when connected to wifi"
+    bool "Start the web server even when connected to wifi"
 
 config SPIFFS_VFS_BASE_PATH
     depends on USE_SETUP_WEB_INTERFACE || START_WEBSERVER_IN_STATION_MODE
     string "Base vfs path for SPIFFS"
     default "/data"
 
-config CONFIG_ENABLE_DEVICE_API_IN_STATION_MODE
+config ENABLE_DEVICE_API_IN_STATION_MODE
     depends on START_WEBSERVER_IN_STATION_MODE
-    boolean "Enable device control API in station mode (SECURITY RISK!)"
+    bool "Enable device control API in station mode (SECURITY RISK!)"
+
+config ENABLE_MDNS
+    bool "Announce the device by mDNS as <hostname>.local"
+    default y
 
 endmenu
