@@ -58,6 +58,11 @@ void AppFramework::init()
     NVS nvs("wifi");
 
     m_wifi->setWifiEventHandler(this);
+#ifdef CONFIG_USE_SETUP_WEB_INTERFACE
+    // Before the wifi starts: when the setup AP is needed, it comes up configured right away
+    string apPassword = CONFIG_AP_MODE_PASSWORD;
+    m_wifi->setAPConfig(m_hostname, apPassword, apPassword.empty() ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_WPA3_PSK);
+#endif
 
     if (m_ssid.empty())
     {
