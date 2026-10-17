@@ -7,11 +7,13 @@
 
 #include <string>
 #include <utility>
+#include <functional>
 #include <esp_timer.h>
 #include "WiFi.h"
 #include "esp_http_server.h"
 #include "ApiHttpRequest.h"
 #include "ApiHttpResponse.h"
+#include "nlohmann/json.hpp"
 
 #define APP_RUN(x) extern "C" { void app_main() { x.run(); }}
 
@@ -30,6 +32,9 @@ public:
     virtual void apStopped() {};
     virtual void staActive() {};
     virtual void staStopped() {};
+    // The setup page tests new wifi credentials. Called from the web server task.
+    virtual void setupConnectStarted() {};
+    virtual void setupConnectFinished(bool connected) {};
 };
 
 class AppFramework : public WiFiEventHandler
@@ -41,8 +46,17 @@ public:
     // Credentials to use instead of the stored ones, call before init()
     inline void setAuthentication(std::string ssid, std::string password) { m_ssid = std::move(ssid); m_password = std::move(password); };
     inline void setWebAppIsSpa(bool spa) { m_webAppIsSpa = spa; };
+    // Adds the app's own fields to the /deviceData reply
+    inline void setDeviceDataHandler(std::function<void(nlohmann::json &reply)> handler) { m_deviceDataHandler = std::move(handler); };
+    // mDNS instance name, the hostname if not set. Call before init().
+    inline void setMdnsInstance(std::string instance) { m_mdnsInstance = std::move(instance); };
+    // Open the setup access point instead of joining the network. Before init(), init() does it.
+    void startSetup();
+    // Before an update overwrites the web interface: the web server stays down until restart
+    void stopWebServer();
 
-    inline std::string hostname() { return m_hostname; };
+    // Available before init()
+    std::string hostname();
     inline std::string ipAddress() { return m_ipAddress; };
     [[nodiscard]] inline bool stationActive() const { return m_staActive; };
     [[nodiscard]] inline bool apActive() const { return m_apActive; };
@@ -84,6 +98,10 @@ private:
     volatile bool m_apFallback = false;
     volatile int m_failedAttempts = 0;
     volatile bool m_webserverStarted = false;
+    volatile bool m_webserverStopped = false;
+    // Setup was asked for: no joining the network until the setup page has new credentials
+    volatile bool m_forceSetup = false;
+    bool m_initDone = false;
     bool m_webAppIsSpa = false;
     std::string m_ipAddress;
 
@@ -95,6 +113,8 @@ private:
     std::string m_ssid = {};
     std::string m_password = {};
     std::string m_hostname;
+    std::string m_mdnsInstance;
+    std::function<void(nlohmann::json &reply)> m_deviceDataHandler;
 #ifdef APP_FRAMEWORK_WEBSERVER
     std::string m_spiffsPartitionName = CONFIG_WEB_INTERFACE_SPIFFS_PARTITION_NAME;
 #endif

@@ -15,7 +15,19 @@ framework.setWebAppIsSpa(true);  // Unknown paths serve index.html
 framework.init();                // Doesn't block, the outcome arrives through the handler
 ```
 
-The handler is called from the wifi event task: return quickly.
+The handler is called from the wifi event task: return quickly. `setupConnectStarted()`
+and `setupConnectFinished(bool)` come from the web server task, while the setup page
+tests new credentials.
+
+More, all optional:
+
+```cpp
+framework.setDeviceDataHandler([](nlohmann::json &reply) { reply["mine"] = 42; }); // Own fields in /deviceData
+framework.setMdnsInstance("My Device");  // Before init(), else the hostname
+framework.startSetup();                  // Open the setup AP instead of joining the network
+framework.stopWebServer();               // Before an update overwrites the web interface
+framework.hostname();                    // Also before init()
+```
 
 ## Behaviour
 

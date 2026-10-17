@@ -36,9 +36,8 @@ AppFramework::AppFramework(WiFi *wifi)
 
 void AppFramework::init()
 {
-    m_hostname = generateHostname();
     // Before the wifi starts, the station netif takes the name when it's created
-    m_wifi->setStationHostname(m_hostname);
+    m_wifi->setStationHostname(hostname());
 
 #ifdef APP_FRAMEWORK_WEBSERVER
     UrlMapper::AddMapping("POST", "/deviceData", [this](auto& request, auto& response){this->deviceData(request, response);});
@@ -72,7 +71,7 @@ void AppFramework::init()
             m_password.clear();
     }
 
-    if (!m_ssid.empty())
+    if (!m_ssid.empty() && !m_forceSetup)
     {
         ESP_LOGI(TAG, "Connecting to %s as %s", m_ssid.c_str(), m_hostname.c_str());
         // Don't wait: the outcome arrives as events, failures open the setup AP
@@ -87,6 +86,46 @@ void AppFramework::init()
         ESP_LOGW(TAG, "No wifi configured and no setup web interface");
 #endif
     }
+
+    m_initDone = true;
+}
+
+string AppFramework::hostname()
+{
+    if (m_hostname.empty())
+        m_hostname = generateHostname();
+    return m_hostname;
+}
+
+void AppFramework::startSetup()
+{
+#ifdef CONFIG_USE_SETUP_WEB_INTERFACE
+    m_forceSetup = true;
+    if (!m_initDone)
+        return;
+
+    ESP_LOGI(TAG, "Setup asked for, starting setup access point %s", m_hostname.c_str());
+    if (m_retryTimer)
+        esp_timer_stop(m_retryTimer);
+    m_apFallback = false;
+    m_wifi->disconnectSTA();
+    if (!m_apActive)
+        startSetupAp();
+#endif
+}
+
+void AppFramework::stopWebServer()
+{
+#ifdef APP_FRAMEWORK_WEBSERVER
+    m_webserverStopped = true;
+    if (m_webserverStarted)
+    {
+        SimpleWebServer::stop_webserver(m_webserver);
+        m_webserver = nullptr;
+        m_webserverStarted = false;
+    }
+#endif
+    captDns.stop();
 }
 
 void AppFramework::forgetWifi()
@@ -143,7 +182,7 @@ void AppFramework::retryTimerThunk(void *arg)
 
 void AppFramework::retryStation()
 {
-    if (m_staActive || m_testConnection || m_ssid.empty())
+    if (m_staActive || m_testConnection || m_forceSetup || m_ssid.empty())
         return;
 
     // Joining scans all channels, which takes the AP off its channel. Leave anyone using it alone.
@@ -163,7 +202,7 @@ void AppFramework::startMdns()
 
     m_mdns = new MDNS();
     m_mdns->setHostname(m_hostname);
-    m_mdns->setInstance(m_hostname);
+    m_mdns->setInstance(m_mdnsInstance.empty() ? m_hostname : m_mdnsInstance);
     if (m_startWebserverInStationMode)
         m_mdns->serviceAdd((const char *) nullptr, "_http", "_tcp", 80);
 #endif
@@ -208,6 +247,10 @@ esp_err_t AppFramework::staDisconnected(wifi_event_sta_disconnected_t *info)
 
     stationLost();
 
+    // Dropped for setup, no retrying
+    if (m_forceSetup)
+        return ESP_OK;
+
     m_failedAttempts = m_failedAttempts + 1;
     ESP_LOGW(TAG, "Disconnected from %s, reason %d, attempt %d", m_ssid.c_str(), info->reason, m_failedAttempts);
 
@@ -247,7 +290,7 @@ esp_err_t AppFramework::staGotIp(ip_event_got_ip_t *info)
     if (!m_staActive)
     {
 #ifdef APP_FRAMEWORK_WEBSERVER
-        if (m_startWebserverInStationMode && !m_webserverStarted)
+        if (m_startWebserverInStationMode && !m_webserverStarted && !m_webserverStopped)
         {
             m_webserver = SimpleWebServer::start_webserver(CONFIG_SPIFFS_VFS_BASE_PATH, m_webAppIsSpa);
             m_webserverStarted = m_webserver != nullptr;
@@ -275,7 +318,7 @@ esp_err_t AppFramework::apStart()
     if (!m_apActive)
     {
 #ifdef CONFIG_USE_SETUP_WEB_INTERFACE
-        if (!m_webserverStarted)
+        if (!m_webserverStarted && !m_webserverStopped)
         {
             m_webserver = SimpleWebServer::start_webserver(CONFIG_SPIFFS_VFS_BASE_PATH, m_webAppIsSpa);
             m_webserverStarted = m_webserver != nullptr;
@@ -356,6 +399,8 @@ void AppFramework::deviceData(const ApiHttpRequest &req, ApiHttpResponse &resp)
         {"ip", m_ipAddress},
         {"hostname", m_hostname + ".local"},
     };
+    if (m_deviceDataHandler)
+        m_deviceDataHandler(reply);
 
     resp.AddHeader("Content-type", "application/json");
 
@@ -470,6 +515,7 @@ void AppFramework::wifiModeTask(void *arg)
 
     ESP_LOGI(TAG, "Stopping AP");
     framework->m_apFallback = false;
+    framework->m_forceSetup = false;
     framework->m_failedAttempts = 0;
     framework->m_wifi->stopAP();
     vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -485,6 +531,8 @@ esp_err_t AppFramework::tryConnectWifi(const std::string& ssid, const std::strin
         return ESP_ERR_INVALID_STATE;
 
     m_testConnection = true;
+    if (m_handler)
+        m_handler->setupConnectStarted();
 
     ESP_LOGI(TAG,"Attempting to connect to wifi, ssid %s", ssid.c_str());
     // Only a test, the access point stays up so the setup page can show the outcome
@@ -496,6 +544,8 @@ esp_err_t AppFramework::tryConnectWifi(const std::string& ssid, const std::strin
     if (ret)
     {
         m_wifi->disconnectSTA();
+        if (m_handler)
+            m_handler->setupConnectFinished(false);
         return ret;
     }
 
@@ -511,6 +561,9 @@ esp_err_t AppFramework::tryConnectWifi(const std::string& ssid, const std::strin
 
     captDns.stop();
     SimpleWebServer::setRedirectToCaptive(false);
+
+    if (m_handler)
+        m_handler->setupConnectFinished(true);
 
     return ESP_OK;
 }
